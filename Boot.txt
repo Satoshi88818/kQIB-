@@ -1,0 +1,171 @@
+/*
+ * Minimal 16-bit real-mode "guest microkernel stand-in" for QEMU-based
+ * validation of qib_muk::ipc::SharedRingBuffer across a real execution
+ * boundary (a genuinely separate x86 CPU context running raw machine
+ * code, no OS, no Rust runtime -- as close as this environment can get
+ * to "real bare-metal microkernel code" without a nightly/cross Rust
+ * toolchain).
+ *
+ * This is loaded by the BIOS as a classic MBR boot sector at 0x7c00 and
+ * executes in real mode from CPU reset. It does NOT decode
+ * qib_muk::ipc::IpcMessage's enum layout -- that's out of scope for what
+ * this test proves. What it DOES exercise, using the real, empirically
+ * verified byte offsets of SharedRingBuffer's head/tail/message-slot
+ * layout (see layout-probe/, whose output is quoted below), is the
+ * load-bearing synchronization protocol itself:
+ *
+ *   - Reading a host-written `tail`/`head` pair (AtomicUsize, written by
+ *     the REAL qib_muk::ipc::SharedRingBuffer::push() on the host side)
+ *     and correctly detecting a pending message.
+ *   - Advancing its own side's index (tail, as the RX ring's consumer)
+ *     with the same wraparound arithmetic `pop()` uses.
+ *   - Acting as producer on a second ring (TX), writing into the correct
+ *     message slot (computed as head_index * size_of::<IpcMessage>(),
+ *     the exact stride the real struct uses) and advancing head with the
+ *     same protocol `push()` uses.
+ *
+ * Verified layout constants (from `cargo run -p layout-probe`):
+ *   size_of::<SharedRingBuffer>() = 18456
+ *   size_of::<IpcMessage>()       = 72     (MSG_SIZE below)
+ *   RING_SIZE                     = 256
+ *   HEAD_OFFSET                   = 18432  (0x4800)
+ *   TAIL_OFFSET                   = 18440  (0x4808)
+ * head/tail are AtomicUsize (8 bytes); only the low 32 bits are used here
+ * since ring indices are always < 256, so the high dword is always zero
+ * on both sides -- reading/writing just the low dword is exact, not an
+ * approximation.
+ */
+
+.code16gcc
+.intel_syntax noprefix
+.text
+.globl _start
+
+RX_SEG      = 0x2000   /* physical 0x20000 */
+TX_SEG      = 0x4000   /* physical 0x40000 */
+DONE_SEG    = 0x5000   /* physical 0x50000 */
+HEAD_OFF    = 0x4800   /* 18432 */
+TAIL_OFF    = 0x4808   /* 18440 */
+MSG_SIZE    = 72
+RING_MASK   = 0xFF     /* RING_SIZE - 1, RING_SIZE is a power of two */
+ITER_COUNT  = 5
+
+_start:
+    cli
+    xor ax, ax
+    mov ds, ax
+    mov ss, ax
+    mov sp, 0x7c00
+
+    mov si, offset msg_boot
+    call print_serial
+
+    /* DEBUG: dump raw head/tail dwords the guest observes at RX_SEG */
+    mov ax, RX_SEG
+    mov es, ax
+    mov eax, es:[HEAD_OFF]
+    call print_hex32
+    mov si, offset msg_nl
+    call print_serial
+    mov eax, es:[TAIL_OFF]
+    call print_hex32
+    mov si, offset msg_nl
+    call print_serial
+
+    mov cx, ITER_COUNT
+
+process_loop:
+    /* ---- Consume one message from the RX ring (ES = RX_SEG) ---- */
+    mov ax, RX_SEG
+    mov es, ax
+wait_rx:
+    mov eax, es:[TAIL_OFF]
+    cmp eax, es:[HEAD_OFF]
+    je wait_rx                      /* tail == head => ring empty, spin */
+
+    mov eax, es:[TAIL_OFF]
+    inc eax
+    and eax, RING_MASK
+    mov es:[TAIL_OFF], eax          /* advance RX tail: real pop() protocol */
+
+    /* ---- Produce one reply onto the TX ring (ES = TX_SEG) ---- */
+    mov ax, TX_SEG
+    mov es, ax
+    mov eax, es:[HEAD_OFF]          /* current TX head = target slot index */
+    mov ebx, eax
+    imul ebx, ebx, MSG_SIZE         /* slot byte offset = index * size_of::<IpcMessage>() */
+    mov dword ptr es:[ebx], 0xCAFEBABE   /* marker: proves guest computed the real stride */
+    inc eax
+    and eax, RING_MASK
+    mov es:[HEAD_OFF], eax          /* advance TX head: real push() protocol */
+
+    loop process_loop
+
+    /* ---- Signal completion ---- */
+    mov ax, DONE_SEG
+    mov es, ax
+    mov dword ptr es:[0], 0x1234
+
+    mov si, offset msg_done
+    call print_serial
+
+    /* QEMU isa-debug-exit: exit(value*2+1) as the QEMU process's exit code */
+    mov al, 0x10
+    out 0xf4, al
+
+hang:
+    hlt
+    jmp hang
+
+/* ---- Minimal polled 16550 UART (COM1, 0x3F8) serial output ---- */
+print_serial:
+.Lloop:
+    lodsb
+    cmp al, 0
+    je .Ldone
+    call print_char
+    jmp .Lloop
+.Ldone:
+    ret
+
+print_char:
+    /* entry: AL = character to print. IN clobbers AL, so stash it in BL
+       across the LSR poll rather than trying to push/pop around it. */
+    mov bl, al
+    push dx
+    mov dx, 0x3FD
+.Lwait_thr:
+    in al, dx
+    test al, 0x20
+    jz .Lwait_thr
+    mov al, bl
+    mov dx, 0x3F8
+    out dx, al
+    pop dx
+    ret
+
+msg_boot: .asciz "QIB-GUEST: booted\r\n"
+msg_done: .asciz "QIB-GUEST: done, all 5 messages processed\r\n"
+msg_nl: .asciz "\r\n"
+hex_digits: .ascii "0123456789ABCDEF"
+
+/* prints EAX as 8 hex digits */
+print_hex32:
+    push cx
+    push bx
+    mov cx, 8
+.Lhexloop:
+    rol eax, 4
+    mov bx, ax
+    and bx, 0xF
+    push ax
+    mov al, [hex_digits + bx]
+    call print_char
+    pop ax
+    loop .Lhexloop
+    pop bx
+    pop cx
+    ret
+
+. = _start + 510
+.word 0xAA55

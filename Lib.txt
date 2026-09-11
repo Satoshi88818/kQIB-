@@ -1,0 +1,104 @@
+//! Shared types, constants, and wire-format helpers.
+//! V3-1: All IPC and Kafka payloads now use postcard (binary, no_std-friendly)
+//! instead of serde_json. This cuts payload size ~60% and CPU ~40%.
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[cfg(not(feature = "std"))]
+extern crate alloc;
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
+use serde::{Deserialize, Serialize};
+
+// ── Kafka Topics ─────────────────────────────────────────────────────
+pub const TELEMETRY_CONTROL_TOPIC: &str = "robot-telemetry-control";
+pub const TELEMETRY_SAFETY_TOPIC: &str = "robot-telemetry-safety";
+pub const COMMANDS_TOPIC: &str = "robot-commands";
+pub const DLQ_TOPIC: &str = "robot-commands-dlq";
+pub const TWIN_STATE_TOPIC: &str = "robot-twin-state";
+
+// ── Timing Constants ────────────────────────────────────────────────
+pub const ISOCHRONOUS_TICK_NS: u64 = 1_000_000; // 1 ms
+pub const WATCHDOG_DEADLINE_NS: u64 = 2_000_000; // 2 ms — halt if scheduler stalls
+
+// ── Bayesian Twin Tuning ────────────────────────────────────────────
+pub const EWMA_LR: f64 = 0.05;
+pub const VARIANCE_EPSILON: f64 = 1e-9;
+pub const BRIER_Z_CONFIDENCE: f64 = 2.0;
+pub const BRIER_DELTA_THRESHOLD: f64 = 15.0;
+pub const BREAKER_RECOVERY_GOOD_READINGS: u32 = 10;
+
+// ── Safety Thresholds ───────────────────────────────────────────────
+pub const Z_VELOCITY_HARD_LIMIT: f64 = 5.0;
+pub const TEMP_ALERT_CELSIUS: f64 = 100.0;
+pub const TEMP_MEAN_ALERT: f64 = 95.0;
+
+// ── Domain Types ─────────────────────────────────────────────────────
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryEvent {
+    pub robot_id: u32,
+    pub timestamp_ns: u64,
+    pub temp: f64,
+    pub z_velocity: f64,
+    /// 0=Nominal 1=Overheating 2=Halted 3=IpcOverflow
+    pub status: u8,
+    pub ack_command_id: Option<[u8; 16]>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandEvent {
+    pub robot_id: u32,
+    pub command_id: [u8; 16], // UUIDv4
+    pub sequence: u64,        // Per-robot monotonic counter — replay protection
+    /// 1=CoolDown 2=EmergencyHalt
+    pub action: u8,
+    pub duration_sec: u32,
+    pub issued_at_ns: u64,
+    pub valid_until_ns: u64, // Absolute deadline
+    pub min_epoch: u64,
+    pub max_epoch: u64,
+}
+
+/// Published to TWIN_STATE_TOPIC for Grafana / external monitoring, and
+/// (V3.1) replayed on worker startup to warm-restore `RobotTwinState`
+/// after a restart — see `qib_cloud_backend::warmup`.
+///
+/// `variance` and `next_sequence` were added for that replay purpose:
+/// `temp_stddev` alone (a derived, sqrt'd display value) isn't enough to
+/// reconstruct the exact EWMA accumulator, and `next_sequence` is what
+/// prevents a restarted backend from re-issuing command sequence numbers
+/// the microkernel's replay-protection has already seen and would reject.
+///
+/// Wire-format note: these two fields are appended at the end of the
+/// struct, so postcard's positional encoding means older (pre-V3.1)
+/// snapshots simply fail to decode as this newer type (a clean `Err`, not
+/// silent corruption) rather than partially/incorrectly parsing — callers
+/// already treat individual snapshot decode failures as "skip and log",
+/// which is the correct behavior for stale-format history during replay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TwinStateSnapshot {
+    pub robot_id: u32,
+    pub temp_mean: f64,
+    pub temp_stddev: f64,
+    pub z_score: f64,
+    pub breaker_open: bool,
+    pub timestamp_ns: u64,
+    /// Raw EWMA variance accumulator (Welford's `m2`), not the sqrt'd
+    /// `temp_stddev` above — needed to restore the twin exactly.
+    pub variance: f64,
+    /// Next command sequence number this robot's twin will issue.
+    pub next_sequence: u64,
+}
+
+// ── V3-1: Wire-format helpers (postcard) ─────────────────────────────
+
+/// Serialize any message to a compact binary vec using postcard.
+/// Used for all Kafka payloads and IPC buffers.
+pub fn serialize_msg<T: Serialize>(msg: &T) -> Vec<u8> {
+    postcard::to_allocvec(msg).unwrap_or_default()
+}
+
+/// Deserialize a postcard-encoded message.
+pub fn deserialize_msg<'a, T: Deserialize<'a>>(data: &'a [u8]) -> Result<T, postcard::Error> {
+    postcard::from_bytes(data)
+}

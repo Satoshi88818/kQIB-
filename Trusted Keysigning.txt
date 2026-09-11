@@ -1,0 +1,330 @@
+//! V3.1 "key management" round: trusted command-signing key management for
+//! the edge proxy, including hot rotation without a process restart. See
+//! `KEY_MANAGEMENT_SCOPE.md` for the full design discussion this is one
+//! concrete increment of.
+//!
+//! Two sources, in priority order:
+//!   - `TRUSTED_PUBKEYS_FILE` — a path to a file with one 32-byte
+//!     hex-encoded Ed25519 public key per line (blank lines and `#`
+//!     comments ignored). `TrustedKeyStore`'s background reload task
+//!     re-reads this file periodically, so an operator (or an external
+//!     process — a Vault agent, a Kubernetes Secret volume refresh,
+//!     whatever the deployment uses) can rotate which keys are trusted by
+//!     replacing the file's contents, without restarting the edge proxy.
+//!     This matters far more here than on the backend
+//!     (`qib-cloud-backend/src/key_source.rs` has no analogous background
+//!     reload): a robot may run for a long time between deployments, and
+//!     re-flashing every robot just to rotate a compromised backend key
+//!     would be a much bigger operational cost than restarting one
+//!     central backend process.
+//!   - `TRUSTED_PUBKEYS` — the original V3.1 behavior: a static,
+//!     comma-separated list in an env var, fixed for the process
+//!     lifetime. Kept for simple/dev deployments; does not rotate.
+//!
+//! If neither is set, verification is disabled (loudly logged) — the
+//! original V3.1 behavior, unchanged.
+
+use ed25519_dalek::VerifyingKey;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+use tracing::{error, info, warn};
+
+/// Parses comma-separated 32-byte hex-encoded Ed25519 public keys.
+/// Malformed entries are logged and skipped rather than aborting the
+/// whole list, so a single typo'd key doesn't take down verification for
+/// every other key.
+///
+/// Pure and side-effect-free (aside from logging) so it's directly unit
+/// testable without touching the environment or filesystem.
+pub fn parse_trusted_keys(raw: &str) -> Vec<VerifyingKey> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| match hex::decode(s) {
+            Ok(bytes) => match <[u8; 32]>::try_from(bytes.as_slice()) {
+                Ok(arr) => match VerifyingKey::from_bytes(&arr) {
+                    Ok(key) => Some(key),
+                    Err(e) => {
+                        error!("Invalid trusted pubkey '{}': {}", s, e);
+                        None
+                    }
+                },
+                Err(_) => {
+                    error!(
+                        "Trusted pubkey '{}' has wrong length: {} bytes (expected 32)",
+                        s,
+                        bytes.len()
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                error!("Failed to hex-decode trusted pubkey '{}': {}", s, e);
+                None
+            }
+        })
+        .collect()
+}
+
+/// Parses a `TRUSTED_PUBKEYS_FILE`-style file: one hex key per line, blank
+/// lines and `#`-prefixed comments ignored. Reuses `parse_trusted_keys` by
+/// joining surviving lines with commas, so the two formats share exactly
+/// one parsing/validation path.
+pub fn parse_trusted_keys_file_contents(contents: &str) -> Vec<VerifyingKey> {
+    let joined = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join(",");
+    parse_trusted_keys(&joined)
+}
+
+fn load_trusted_keys_from_file(path: &str) -> Vec<VerifyingKey> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => {
+            let keys = parse_trusted_keys_file_contents(&contents);
+            info!("Loaded {} trusted command-signing key(s) from {path}", keys.len());
+            keys
+        }
+        Err(e) => {
+            error!(
+                "Failed to read TRUSTED_PUBKEYS_FILE '{path}': {e} — treating as no \
+                 trusted keys (verification disabled until this is fixed)"
+            );
+            vec![]
+        }
+    }
+}
+
+/// Resolves the trusted key set from the environment: `TRUSTED_PUBKEYS_FILE`
+/// takes priority over `TRUSTED_PUBKEYS` when both are set, since it's the
+/// one `TrustedKeyStore`'s background reload can actually act on.
+pub fn load_trusted_keys_from_env() -> Vec<VerifyingKey> {
+    if let Ok(path) = std::env::var("TRUSTED_PUBKEYS_FILE") {
+        return load_trusted_keys_from_file(&path);
+    }
+    match std::env::var("TRUSTED_PUBKEYS") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let keys = parse_trusted_keys(&raw);
+            info!("Loaded {} trusted command-signing key(s) from TRUSTED_PUBKEYS", keys.len());
+            keys
+        }
+        _ => {
+            warn!(
+                "Neither TRUSTED_PUBKEYS nor TRUSTED_PUBKEYS_FILE is set — command \
+                 signature verification is DISABLED"
+            );
+            vec![]
+        }
+    }
+}
+
+/// Thread-safe, hot-reloadable holder for the currently trusted key set.
+/// `handle_command` calls `current()` once per verification (a cheap clone
+/// of a typically-small `Vec`); the background reload task (see
+/// `spawn_reload_task`) is the only writer.
+pub struct TrustedKeyStore {
+    keys: RwLock<Vec<VerifyingKey>>,
+}
+
+impl TrustedKeyStore {
+    pub fn new(initial: Vec<VerifyingKey>) -> Self {
+        Self {
+            keys: RwLock::new(initial),
+        }
+    }
+
+    pub fn from_env() -> Self {
+        Self::new(load_trusted_keys_from_env())
+    }
+
+    /// A snapshot of the currently trusted keys for one verification call.
+    pub fn current(&self) -> Vec<VerifyingKey> {
+        self.keys.read().unwrap().clone()
+    }
+
+    /// Re-resolves from the environment and swaps in the new set. A no-op
+    /// when `TRUSTED_PUBKEYS_FILE` isn't set — rotation only makes sense
+    /// for the file source; `TRUSTED_PUBKEYS` is a static env var fixed
+    /// for the process lifetime, so there's nothing to re-read.
+    pub fn reload(&self) {
+        if std::env::var("TRUSTED_PUBKEYS_FILE").is_err() {
+            return;
+        }
+        let fresh = load_trusted_keys_from_env();
+        *self.keys.write().unwrap() = fresh;
+    }
+}
+
+/// Spawns a background task that calls `store.reload()` every `interval`
+/// for as long as the process runs. Harmless to spawn unconditionally
+/// (including when only the static `TRUSTED_PUBKEYS` source is configured)
+/// since `reload()` itself is a no-op in that case.
+pub fn spawn_reload_task(
+    store: Arc<TrustedKeyStore>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // The first tick fires immediately; skip it since `from_env()`
+        // already did the initial load.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            store.reload();
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    fn unique_temp_file(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "qib-trusted-keys-test-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn parse_trusted_keys_accepts_valid_hex_keys() {
+        let key1 = SigningKey::generate(&mut OsRng).verifying_key();
+        let key2 = SigningKey::generate(&mut OsRng).verifying_key();
+        let raw = format!("{}, {}", hex::encode(key1.to_bytes()), hex::encode(key2.to_bytes()));
+
+        let parsed = parse_trusted_keys(&raw);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].to_bytes(), key1.to_bytes());
+        assert_eq!(parsed[1].to_bytes(), key2.to_bytes());
+    }
+
+    #[test]
+    fn parse_trusted_keys_skips_malformed_entries_but_keeps_valid_ones() {
+        let key = SigningKey::generate(&mut OsRng).verifying_key();
+        let raw = format!("not-hex-at-all,{},deadbeef", hex::encode(key.to_bytes()));
+        let parsed = parse_trusted_keys(&raw);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].to_bytes(), key.to_bytes());
+    }
+
+    #[test]
+    fn parse_trusted_keys_empty_string_yields_empty_list() {
+        assert!(parse_trusted_keys("").is_empty());
+        assert!(parse_trusted_keys("   ").is_empty());
+    }
+
+    #[test]
+    fn parse_trusted_keys_file_contents_skips_blank_lines_and_comments() {
+        let key1 = SigningKey::generate(&mut OsRng).verifying_key();
+        let key2 = SigningKey::generate(&mut OsRng).verifying_key();
+        let contents = format!(
+            "# trusted keys for fleet A\n\n{}\n  # a comment with leading whitespace\n{}\n\n",
+            hex::encode(key1.to_bytes()),
+            hex::encode(key2.to_bytes())
+        );
+        let parsed = parse_trusted_keys_file_contents(&contents);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].to_bytes(), key1.to_bytes());
+        assert_eq!(parsed[1].to_bytes(), key2.to_bytes());
+    }
+
+    #[test]
+    fn store_current_reflects_the_initial_keys() {
+        let key = SigningKey::generate(&mut OsRng).verifying_key();
+        let store = TrustedKeyStore::new(vec![key]);
+        assert_eq!(store.current().len(), 1);
+        assert_eq!(store.current()[0].to_bytes(), key.to_bytes());
+    }
+
+    /// `std::env::set_var`/`remove_var` are process-global; guard so tests
+    /// touching them don't interleave under parallel execution.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn reload_is_a_no_op_without_trusted_pubkeys_file_set() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        std::env::remove_var("TRUSTED_PUBKEYS_FILE");
+
+        let key = SigningKey::generate(&mut OsRng).verifying_key();
+        let store = TrustedKeyStore::new(vec![key]);
+        store.reload();
+
+        assert_eq!(
+            store.current().len(),
+            1,
+            "reload() must be a no-op when only the static TRUSTED_PUBKEYS \
+             source (or nothing) is configured"
+        );
+    }
+
+    #[test]
+    fn reload_picks_up_a_rotated_file() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let path = unique_temp_file("reload");
+        let key1 = SigningKey::generate(&mut OsRng).verifying_key();
+        let key2 = SigningKey::generate(&mut OsRng).verifying_key();
+
+        std::fs::write(&path, hex::encode(key1.to_bytes())).unwrap();
+        std::env::set_var("TRUSTED_PUBKEYS_FILE", path.to_str().unwrap());
+
+        let store = TrustedKeyStore::from_env();
+        assert_eq!(store.current().len(), 1);
+        assert_eq!(store.current()[0].to_bytes(), key1.to_bytes());
+
+        // Rotate: replace the file's contents with a different key.
+        std::fs::write(&path, hex::encode(key2.to_bytes())).unwrap();
+        store.reload();
+
+        assert_eq!(
+            store.current()[0].to_bytes(),
+            key2.to_bytes(),
+            "reload() must pick up the rotated key from the file"
+        );
+
+        std::env::remove_var("TRUSTED_PUBKEYS_FILE");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn spawn_reload_task_actually_reloads_on_a_timer() {
+        let _guard = ENV_GUARD.lock().unwrap();
+        let path = unique_temp_file("background-reload");
+        let key1 = SigningKey::generate(&mut OsRng).verifying_key();
+        let key2 = SigningKey::generate(&mut OsRng).verifying_key();
+
+        std::fs::write(&path, hex::encode(key1.to_bytes())).unwrap();
+        std::env::set_var("TRUSTED_PUBKEYS_FILE", path.to_str().unwrap());
+
+        let store = Arc::new(TrustedKeyStore::from_env());
+        assert_eq!(store.current()[0].to_bytes(), key1.to_bytes());
+
+        let handle = spawn_reload_task(store.clone(), Duration::from_millis(20));
+
+        std::fs::write(&path, hex::encode(key2.to_bytes())).unwrap();
+
+        // Give the background task a few ticks' worth of time to pick up
+        // the change without making this test's timing razor-thin.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if store.current()[0].to_bytes() == key2.to_bytes() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background reload task never picked up the rotated key");
+
+        handle.abort();
+        std::env::remove_var("TRUSTED_PUBKEYS_FILE");
+        std::fs::remove_file(&path).ok();
+    }
+}

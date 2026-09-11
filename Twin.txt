@@ -1,0 +1,104 @@
+//! Per-robot Bayesian Digital Twin with EWMA variance and Brier-score
+//! circuit breaker. Self-contained; no global mutable state.
+use qib_schema::{
+    BREAKER_RECOVERY_GOOD_READINGS, BRIER_DELTA_THRESHOLD, BRIER_Z_CONFIDENCE, EWMA_LR,
+    VARIANCE_EPSILON,
+};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+pub struct RobotTwinState {
+    pub robot_id: u32,
+    pub temp_mean: f64,
+    /// EWMA variance accumulator (Welford online algorithm)
+    pub m2: f64,
+    /// Circuit breaker: open = commands halted for THIS robot only
+    pub breaker_open: AtomicBool,
+    /// Consecutive good readings since last breaker trip (auto-recovery)
+    pub good_readings: AtomicU32,
+    pub last_ack_id: Option<[u8; 16]>,
+    pub next_sequence: u64,
+}
+
+impl RobotTwinState {
+    pub fn new(robot_id: u32, initial_temp: f64) -> Self {
+        Self {
+            robot_id,
+            temp_mean: initial_temp,
+            m2: 0.0,
+            breaker_open: AtomicBool::new(false),
+            good_readings: AtomicU32::new(0),
+            last_ack_id: None,
+            next_sequence: 0,
+        }
+    }
+
+    /// V3.1: reconstructs a twin from a previously-persisted
+    /// `TwinStateSnapshot`, used on worker startup to warm-restore state
+    /// after a restart instead of every robot silently resetting to a
+    /// fresh cold twin (mean re-learned from scratch, breaker force-closed,
+    /// and — most importantly — `next_sequence` reset to 0, which would
+    /// make every command this worker issues get silently dropped by the
+    /// microkernel's replay-protection check, since it has already seen
+    /// higher sequence numbers from before the restart).
+    pub fn restore(
+        robot_id: u32,
+        temp_mean: f64,
+        variance: f64,
+        next_sequence: u64,
+        breaker_open: bool,
+    ) -> Self {
+        Self {
+            robot_id,
+            temp_mean,
+            m2: variance,
+            breaker_open: AtomicBool::new(breaker_open),
+            good_readings: AtomicU32::new(0),
+            last_ack_id: None,
+            next_sequence,
+        }
+    }
+
+    /// EWMA-Welford update. Variance stays bounded; never diverges.
+    pub fn update(&mut self, temp: f64) {
+        let delta1 = temp - self.temp_mean;
+        self.temp_mean += EWMA_LR * delta1;
+        let delta2 = temp - self.temp_mean;
+        self.m2 = (1.0 - EWMA_LR) * self.m2 + EWMA_LR * (delta1 * delta2);
+    }
+
+    /// Standard deviation with epsilon floor to prevent Z-score divide-by-zero.
+    pub fn std_dev(&self) -> f64 {
+        self.m2.sqrt().max(VARIANCE_EPSILON)
+    }
+
+    /// Evaluate Brier-score breaker. Returns true if tripped this call.
+    pub fn evaluate_breaker(&self, predicted_temp: f64, actual_temp: f64) -> bool {
+        let delta = (predicted_temp - actual_temp).abs();
+        let z_score = delta / self.std_dev();
+
+        if z_score > BRIER_Z_CONFIDENCE && delta > BRIER_DELTA_THRESHOLD {
+            self.breaker_open.store(true, Ordering::SeqCst);
+            self.good_readings.store(0, Ordering::SeqCst);
+            return true;
+        }
+
+        if self.breaker_open.load(Ordering::SeqCst) {
+            let good = self.good_readings.fetch_add(1, Ordering::SeqCst) + 1;
+            if good >= BREAKER_RECOVERY_GOOD_READINGS {
+                self.breaker_open.store(false, Ordering::SeqCst);
+                self.good_readings.store(0, Ordering::SeqCst);
+            }
+        }
+        false
+    }
+
+    pub fn is_breaker_open(&self) -> bool {
+        self.breaker_open.load(Ordering::SeqCst)
+    }
+
+    pub fn next_seq(&mut self) -> u64 {
+        let s = self.next_sequence;
+        self.next_sequence += 1;
+        s
+    }
+}

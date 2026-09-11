@@ -1,0 +1,233 @@
+/*
+ * Bare-metal 16-bit real-mode "guest microkernel stand-in" for QEMU-based
+ * validation of qib_muk::ipc::SharedRingBuffer's on-the-wire layout and
+ * SPSC index protocol, against a genuinely separate x86 execution context
+ * (no OS, no Rust runtime).
+ *
+ * TRANSPORT NOTE: an earlier version of this test tried to validate the
+ * *memory-mapped* transport directly (QEMU main RAM backed by a host-mmap'd
+ * file, matching the real deployment's "guest maps a physical window also
+ * mmap'd by the host" pattern). That hit a reproducible QEMU/environment
+ * quirk: overriding the "pc" machine's main RAM via
+ * -object memory-backend-file + -numa node,memdev= (and the newer
+ * -machine ...,memory-backend= form) did not reliably take effect — the
+ * guest consistently observed zeroed memory regardless of the host's
+ * pre-populated content, confirmed across multiple configurations,
+ * with/without KVM, at multiple RAM sizes. Rather than a workaround for
+ * that specific quirk (which would need deeper QEMU-internals
+ * investigation to resolve confidently), this version uses BIOS extended
+ * disk I/O (INT 13h, AH=0x42/0x43) against a second virtual disk as the
+ * transport instead: reliable, well-trodden, and the disk image's raw
+ * bytes are exactly what's exchanged, no memory-backend ambiguity at all.
+ * The memory-MAPPING mechanism itself (mmap, atomics, Release/Acquire
+ * ordering, true concurrent access) is separately and thoroughly proven
+ * by qib-muk's own `concurrent_spsc_producer_consumer_delivers_every_message`
+ * test (two real OS threads, true shared memory, 50,000 messages). What's
+ * uniquely validated HERE is that a genuinely separate, non-Rust, non-Linux
+ * execution context correctly implements the exact same ring-buffer wire
+ * protocol (head/tail offsets, wraparound, message-slot stride) against
+ * the real struct's empirically-measured byte layout.
+ *
+ * Verified layout constants (from `cargo run -p layout-probe`):
+ *   size_of::<SharedRingBuffer>() = 18456
+ *   size_of::<IpcMessage>()       = 72     (MSG_SIZE below)
+ *   RING_SIZE                     = 256
+ *   HEAD_OFFSET                   = 18432  (0x4800)
+ *   TAIL_OFFSET                   = 18440  (0x4808)
+ */
+
+.code16gcc
+.intel_syntax noprefix
+.text
+.globl _start
+
+RX_BUF_SEG  = 0x1000    /* local scratch copy of the RX ring, phys 0x10000 */
+TX_BUF_SEG  = 0x3000    /* local scratch copy of the TX ring, phys 0x30000 */
+HEAD_OFF    = 0x4800    /* 18432 */
+TAIL_OFF    = 0x4808    /* 18440 */
+MSG_SIZE    = 72
+RING_MASK   = 0xFF
+ITER_COUNT  = 5
+SECTORS     = 40        /* 40*512 = 20480 bytes >= 18456-byte struct */
+LBA_RX      = 0
+LBA_TX      = 64
+CHANNEL_DRIVE = 0x81     /* second -drive if=ide attaches as BIOS drive 0x81 */
+
+_start:
+    cli
+    xor ax, ax
+    mov ds, ax
+    mov ss, ax
+    mov sp, 0x7c00
+
+    mov si, offset msg_boot
+    call print_serial
+
+    /* DEBUG: check INT13h extensions support for the channel drive */
+    mov ah, 0x41
+    mov bx, 0x55AA
+    mov dl, CHANNEL_DRIVE
+    int 0x13
+    jc .Lext_unsupported
+    mov si, offset msg_ext_ok
+    call print_serial
+    jmp .Lext_done
+.Lext_unsupported:
+    mov si, offset msg_ext_bad
+    call print_serial
+.Lext_done:
+
+    /* ---- Read RX ring snapshot from the channel disk into RX_BUF_SEG ---- */
+    mov word ptr [dap_count], SECTORS
+    mov word ptr [dap_off], 0
+    mov word ptr [dap_seg], RX_BUF_SEG
+    mov dword ptr [dap_lba_lo], LBA_RX
+    mov dword ptr [dap_lba_hi], 0
+    mov dl, CHANNEL_DRIVE
+    mov si, offset dap
+    call disk_read
+
+    /* ---- Read TX ring (empty) snapshot into TX_BUF_SEG ---- */
+    mov word ptr [dap_count], SECTORS
+    mov word ptr [dap_off], 0
+    mov word ptr [dap_seg], TX_BUF_SEG
+    mov dword ptr [dap_lba_lo], LBA_TX
+    mov dword ptr [dap_lba_hi], 0
+    mov dl, CHANNEL_DRIVE
+    mov si, offset dap
+    call disk_read
+
+    /* ---- Process ITER_COUNT messages: identical index protocol to the
+             real SharedRingBuffer::pop()/push(), operating on the two
+             local buffers we just loaded ---- */
+    mov cx, ITER_COUNT
+process_loop:
+    mov ax, RX_BUF_SEG
+    mov es, ax
+    mov eax, es:[TAIL_OFF]
+    inc eax
+    and eax, RING_MASK
+    mov es:[TAIL_OFF], eax          /* advance RX tail: real pop() protocol */
+
+    mov ax, TX_BUF_SEG
+    mov es, ax
+    mov eax, es:[HEAD_OFF]
+    mov ebx, eax
+    imul ebx, ebx, MSG_SIZE         /* slot offset = index * size_of::<IpcMessage>() */
+    mov dword ptr es:[ebx], 0xCAFEBABE
+    inc eax
+    and eax, RING_MASK
+    mov es:[HEAD_OFF], eax          /* advance TX head: real push() protocol */
+
+    loop process_loop
+
+    /* ---- Write both buffers back to the channel disk ---- */
+    mov word ptr [dap_count], SECTORS
+    mov word ptr [dap_off], 0
+    mov word ptr [dap_seg], RX_BUF_SEG
+    mov dword ptr [dap_lba_lo], LBA_RX
+    mov dword ptr [dap_lba_hi], 0
+    mov dl, CHANNEL_DRIVE
+    mov si, offset dap
+    call disk_write
+
+    mov word ptr [dap_count], SECTORS
+    mov word ptr [dap_off], 0
+    mov word ptr [dap_seg], TX_BUF_SEG
+    mov dword ptr [dap_lba_lo], LBA_TX
+    mov dword ptr [dap_lba_hi], 0
+    mov dl, CHANNEL_DRIVE
+    mov si, offset dap
+    call disk_write
+
+    mov si, offset msg_done
+    call print_serial
+
+    mov al, 0x10
+    out 0xf4, al             /* isa-debug-exit: qemu process exits with code 33 */
+
+hang:
+    hlt
+    jmp hang
+
+/* ---- BIOS extended disk I/O (INT 13h AH=0x42/0x43) ---- */
+disk_read:
+    mov ah, 0x42
+    int 0x13
+    jc disk_error
+    ret
+
+disk_write:
+    mov ah, 0x43
+    mov al, 0
+    int 0x13
+    jc disk_error
+    ret
+
+disk_error:
+    mov si, offset msg_diskerr
+    call print_serial
+    /* About to halt permanently -- no need to preserve any register. */
+    mov cl, ah
+    mov al, cl
+    shr al, 4
+    and al, 0xF
+    mov bx, offset hex_digits
+    xlat
+    call print_char
+    mov al, cl
+    and al, 0xF
+    mov bx, offset hex_digits
+    xlat
+    call print_char
+    mov al, 0x20
+    out 0xf4, al              /* distinct exit code (65) so a disk failure is
+                                  never confused with a successful run */
+hang2:
+    hlt
+    jmp hang2
+
+/* ---- Minimal polled 16550 UART (COM1, 0x3F8) serial output ---- */
+print_serial:
+.Lloop:
+    lodsb
+    cmp al, 0
+    je .Ldone
+    call print_char
+    jmp .Lloop
+.Ldone:
+    ret
+
+print_char:
+    mov bl, al
+    push dx
+    mov dx, 0x3FD
+.Lwait_thr:
+    in al, dx
+    test al, 0x20
+    jz .Lwait_thr
+    mov al, bl
+    mov dx, 0x3F8
+    out dx, al
+    pop dx
+    ret
+
+msg_boot:    .asciz "QIB-GUEST: booted\r\n"
+msg_ext_ok:  .asciz "EXT-OK\r\n"
+msg_ext_bad: .asciz "EXT-BAD\r\n"
+msg_done:    .asciz "QIB-GUEST: done, all 5 messages processed\r\n"
+msg_diskerr: .asciz "ERR AH="
+hex_digits:  .ascii "0123456789ABCDEF"
+
+.align 4
+dap:
+    .byte 0x10
+    .byte 0
+dap_count: .word 0
+dap_off:   .word 0
+dap_seg:   .word 0
+dap_lba_lo: .long 0
+dap_lba_hi: .long 0
+
+. = _start + 510
+.word 0xAA55

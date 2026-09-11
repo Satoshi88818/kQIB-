@@ -1,0 +1,290 @@
+//! QEMU-based validation of `qib_muk::ipc::SharedRingBuffer` across a
+//! genuinely separate execution context: a bare-metal x86 real-mode guest
+//! (`boot.S`, built by `build.rs`), running as its own CPU context inside
+//! QEMU with no OS, no Rust runtime, and no relationship to this test
+//! process other than a shared block of physical memory — the same
+//! fundamental setup as the real deployment's microkernel-and-edge-proxy
+//! relationship, just with QEMU standing in for real hardware and a
+//! minimal hand-written guest standing in for the actual microkernel
+//! scheduler (which needs a nightly/cross Rust toolchain this environment
+//! doesn't have — see the crate-level README for the full explanation of
+//! that scoping decision).
+//!
+//! ## What this proves
+//! The host side of this test uses the REAL, unmodified
+//! `qib_muk::ipc::SharedRingBuffer::push()` — the exact same production
+//! code path the edge proxy calls — to enqueue commands, exactly as if
+//! this were the edge proxy talking to a real microkernel. The guest,
+//! running as raw machine code with its own independent instruction
+//! stream, reads and mutates that same memory using hand-written assembly
+//! that implements the identical SPSC index protocol (the load-bearing
+//! synchronization the `&mut self` -> `UnsafeCell`+`&self` fix earlier in
+//! this project made sound). If the guest's raw reads of `tail`/`head`
+//! ever failed to observe the host's writes (a memory-model or layout
+//! mismatch), or if the two sides' index arithmetic diverged, this test
+//! would hang (the guest's `wait_rx` spin-loop would never see a pending
+//! message) or produce corrupted marker data — not silently pass.
+//!
+//! ## What this does NOT prove
+//! It doesn't decode `IpcMessage`'s actual enum payload in the guest (see
+//! the crate-level docs for why), and it doesn't run on real hardware —
+//! QEMU's TCG/KVM execution is instruction-accurate but not a substitute
+//! for a real board's memory controller, cache coherency, or bootloader.
+
+use anyhow::{bail, Context, Result};
+use qib_muk::ipc::{IpcMessage, SharedRingBuffer};
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::time::Duration;
+use wait_timeout::ChildExt;
+
+/// Guest-physical byte offsets, matching the constants hardcoded in
+/// `boot.S` (which in turn were derived from `layout-probe`'s verified
+/// measurement of the real struct's layout — see that crate for the
+/// source of truth these numbers must stay in sync with).
+const RX_OFFSET: usize = 0x20000;
+const TX_OFFSET: usize = 0x40000;
+const DONE_OFFSET: usize = 0x50000;
+const GUEST_RAM_SIZE: usize = 8 * 1024 * 1024; // 8 MiB, comfortably covers all three regions
+
+const ITER_COUNT: usize = 5;
+const MARKER: u32 = 0xCAFEBABE;
+const DONE_SENTINEL: u32 = 0x1234;
+/// QEMU's own process exit code for `isa-debug-exit` with value 0x10:
+/// (0x10 << 1) | 1 = 33. This is how the guest signals clean completion
+/// without the host needing to poll or guess when it's done.
+const EXPECTED_QEMU_EXIT_CODE: i32 = 33;
+
+/// Maps the whole guest-RAM-backing file into this process and returns a
+/// raw pointer to its start, alongside the open `File` (kept alive for
+/// the duration of the mapping).
+struct GuestRam {
+    ptr: *mut u8,
+    len: usize,
+    _file: std::fs::File,
+}
+
+impl GuestRam {
+    fn create(path: &std::path::Path, len: usize) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .context("failed to create guest RAM backing file")?;
+        file.set_len(len as u64)
+            .context("failed to size guest RAM backing file")?;
+
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                std::os::unix::io::AsRawFd::as_raw_fd(&file),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            bail!(
+                "mmap of guest RAM backing file failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+
+        Ok(Self {
+            ptr: ptr as *mut u8,
+            len,
+            _file: file,
+        })
+    }
+
+    /// Interprets the memory at `offset` as a `SharedRingBuffer`,
+    /// constructing a fresh one in place. Mirrors the "I am the creator"
+    /// path in `qib-edge-proxy/src/shm.rs`.
+    unsafe fn init_ring_at(&self, offset: usize) -> &'static SharedRingBuffer {
+        assert!(offset + std::mem::size_of::<SharedRingBuffer>() <= self.len);
+        let ptr = self.ptr.add(offset) as *mut SharedRingBuffer;
+        std::ptr::write(ptr, SharedRingBuffer::new());
+        &*(ptr as *const SharedRingBuffer)
+    }
+
+    /// Forces our writes out to the backing file. Empirically required
+    /// here (verified by direct experiment, not just theory): QEMU is a
+    /// wholly separate process that opens and mmaps this same file itself
+    /// — without an explicit `msync` before launching it, the guest
+    /// observed all-zero memory despite this process's own mmap already
+    /// reflecting the pushed messages, i.e. a real, reproducible
+    /// visibility gap between "written via this mmap" and "durably
+    /// readable by another process," not just a theoretical concern.
+    fn sync(&self) -> Result<()> {
+        let rc = unsafe { libc::msync(self.ptr as *mut libc::c_void, self.len, libc::MS_SYNC) };
+        if rc != 0 {
+            bail!("msync failed: {}", std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    unsafe fn read_u32(&self, offset: usize) -> u32 {
+        assert!(offset + 4 <= self.len);
+        let ptr = self.ptr.add(offset) as *const u32;
+        std::ptr::read_unaligned(ptr)
+    }
+}
+
+fn command_message(sequence: u64) -> IpcMessage {
+    IpcMessage::Command {
+        action: 1,
+        duration_sec: 60,
+        valid_until_ns: u64::MAX,
+        issued_at_ns: 0,
+        min_epoch: 1,
+        max_epoch: u64::MAX,
+        sequence,
+        command_id: [sequence as u8; 16],
+    }
+}
+
+#[test]
+fn bare_metal_guest_and_real_push_pop_agree_on_the_ring_protocol() {
+    let work_dir = std::env::temp_dir().join(format!("qib-qemu-test-{}", std::process::id()));
+    std::fs::create_dir_all(&work_dir).expect("failed to create work dir");
+    let ram_path = work_dir.join("guest-ram.img");
+
+    // ── 1. Set up guest RAM and pre-populate the RX ring using the REAL
+    //       production SharedRingBuffer::push() ─────────────────────────
+    let ram = GuestRam::create(&ram_path, GUEST_RAM_SIZE).expect("failed to create guest RAM");
+    let rx_ring = unsafe { ram.init_ring_at(RX_OFFSET) };
+    let _tx_ring = unsafe { ram.init_ring_at(TX_OFFSET) };
+
+    for seq in 0..ITER_COUNT as u64 {
+        assert!(
+            rx_ring.push(command_message(seq)),
+            "pre-populating the RX ring via the real push() should not overflow"
+        );
+    }
+    ram.sync().expect("failed to sync guest RAM to the backing file before booting QEMU");
+
+    // ── 2. Boot the bare-metal guest in QEMU against this exact file as
+    //       its entire physical RAM ──────────────────────────────────────
+    let boot_bin = env!("QIB_BOOT_BIN");
+    let ram_size_mb = format!("{}M", GUEST_RAM_SIZE / (1024 * 1024));
+
+    let mut child = Command::new("qemu-system-x86_64")
+        .args([
+            "-machine",
+            "pc",
+            "-cpu",
+            "qemu64",
+            "-m",
+            &ram_size_mb,
+            "-object",
+        ])
+        .arg(format!(
+            "memory-backend-file,id=mem,mem-path={},size={},share=on",
+            ram_path.display(),
+            ram_size_mb
+        ))
+        .args(["-numa", "node,memdev=mem"])
+        .args(["-drive"])
+        .arg(format!("file={boot_bin},format=raw,if=ide"))
+        .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
+        .args(["-display", "none"])
+        .args(["-serial", "stdio"])
+        .args(["-no-reboot"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn qemu-system-x86_64 — is it installed?");
+
+    let status = child
+        .wait_timeout(Duration::from_secs(30))
+        .expect("failed to wait on qemu process")
+        .unwrap_or_else(|| {
+            child.kill().ok();
+            panic!(
+                "qemu-system-x86_64 did not exit within 30s — the bare-metal guest likely \
+                 hung (e.g. the RX ring's tail/head were never observed to differ), which \
+                 would itself indicate a real cross-boundary visibility problem"
+            );
+        });
+
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .ok();
+
+    println!("---- guest serial output ----\n{stdout}---- end guest serial output ----");
+
+    assert!(
+        stdout.contains("QIB-GUEST: booted"),
+        "guest never printed its boot message — it may not have booted at all"
+    );
+    assert!(
+        stdout.contains("QIB-GUEST: done"),
+        "guest never printed its completion message — got:\n{stdout}"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.code(),
+            Some(EXPECTED_QEMU_EXIT_CODE),
+            "expected QEMU to exit via isa-debug-exit with code {EXPECTED_QEMU_EXIT_CODE} \
+             (signal: {:?})",
+            status.signal()
+        );
+    }
+
+    // ── 3. Validate the guest's writes, reading through the SAME mmap ───
+    //
+    // MAP_SHARED means these reads see exactly what the guest (via
+    // QEMU's memory-backend-file, share=on) wrote to physical RAM — no
+    // extra synchronization needed since the guest has already exited.
+    unsafe {
+        let done = ram.read_u32(DONE_OFFSET);
+        assert_eq!(
+            done, DONE_SENTINEL,
+            "guest did not reach its completion marker — it may have hung or crashed mid-loop"
+        );
+
+        // RX ring: tail must have advanced by exactly ITER_COUNT, proving
+        // the guest's consumer-side index arithmetic matches pop()'s.
+        let rx_tail = ram.read_u32(RX_OFFSET + 18440 /* TAIL_OFFSET */);
+        assert_eq!(
+            rx_tail as usize, ITER_COUNT,
+            "RX ring's tail should have advanced by exactly {ITER_COUNT} \
+             (one per guest consume) — got {rx_tail}"
+        );
+
+        // TX ring: head must have advanced by exactly ITER_COUNT, and
+        // every slot 0..ITER_COUNT must contain the marker at the exact
+        // stride (index * size_of::<IpcMessage>()) push() itself uses.
+        let tx_head = ram.read_u32(TX_OFFSET + 18432 /* HEAD_OFFSET */);
+        assert_eq!(
+            tx_head as usize, ITER_COUNT,
+            "TX ring's head should have advanced by exactly {ITER_COUNT} \
+             (one per guest produce) — got {tx_head}"
+        );
+
+        for i in 0..ITER_COUNT {
+            let slot_offset = TX_OFFSET + i * std::mem::size_of::<IpcMessage>();
+            let marker = ram.read_u32(slot_offset);
+            assert_eq!(
+                marker, MARKER,
+                "TX ring slot {i} did not contain the expected marker — the guest's \
+                 slot-offset computation (index * size_of::<IpcMessage>()) may not \
+                 match the real struct's actual stride"
+            );
+        }
+    }
+
+    std::fs::remove_dir_all(&work_dir).ok();
+}
