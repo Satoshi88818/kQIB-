@@ -1,0 +1,176 @@
+//! V3-6: Verify contextual signature binding.
+//! A signature generated for robot A must not verify for robot B.
+use ed25519_dalek::SigningKey;
+use qib_cloud_backend::{sign_command, sign_command_set, SigningKeySet};
+use qib_schema::CommandEvent;
+use rand::rngs::OsRng;
+
+fn make_cmd(robot_id: u32) -> CommandEvent {
+    CommandEvent {
+        robot_id,
+        command_id: [0u8; 16],
+        sequence: 1,
+        action: 1,
+        duration_sec: 300,
+        issued_at_ns: 0,
+        valid_until_ns: u64::MAX,
+        min_epoch: 1,
+        max_epoch: u64::MAX,
+    }
+}
+
+#[test]
+fn signature_is_robot_specific() {
+    let key = SigningKey::generate(&mut OsRng);
+    let cmd_a = make_cmd(1);
+    let cmd_b = make_cmd(2); // different robot, same payload otherwise
+
+    let sig_a = sign_command(&cmd_a, &key);
+    let sig_b = sign_command(&cmd_b, &key);
+
+    // Signatures must differ even though action/sequence are identical
+    assert_ne!(
+        sig_a.to_bytes(),
+        sig_b.to_bytes(),
+        "Signatures should differ across robot IDs"
+    );
+}
+
+/// `std::env::set_var` is process-global, so the three tests below must not
+/// run concurrently with each other (cargo runs tests in the same binary in
+/// parallel by default) — guarded with a shared mutex.
+static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn load_signing_key_respects_explicit_seed() {
+    let _guard = ENV_GUARD.lock().unwrap();
+    // A fixed, known 32-byte seed as 64 hex chars.
+    let seed_hex = "00".repeat(31) + "01";
+    std::env::set_var("SIGNING_KEY_SEED_HEX", &seed_hex);
+
+    let key1 = qib_cloud_backend::load_signing_key().unwrap();
+    let key2 = qib_cloud_backend::load_signing_key().unwrap();
+
+    // Same seed must always yield the same key material — required so the
+    // backend's signing key survives a restart without invalidating every
+    // edge proxy's TRUSTED_PUBKEYS.
+    assert_eq!(key1.to_bytes(), key2.to_bytes());
+
+    std::env::remove_var("SIGNING_KEY_SEED_HEX");
+}
+
+#[test]
+fn load_signing_key_generates_ephemeral_key_when_unset() {
+    let _guard = ENV_GUARD.lock().unwrap();
+    std::env::remove_var("SIGNING_KEY_SEED_HEX");
+    let key1 = qib_cloud_backend::load_signing_key().unwrap();
+    let key2 = qib_cloud_backend::load_signing_key().unwrap();
+    // Ephemeral fallback keys should differ run-to-run (they're random) —
+    // this is a smoke test that the fallback path doesn't just return a
+    // fixed all-zero key or similar.
+    assert_ne!(key1.to_bytes(), key2.to_bytes());
+}
+
+#[test]
+fn load_signing_key_rejects_malformed_seed() {
+    let _guard = ENV_GUARD.lock().unwrap();
+    std::env::set_var("SIGNING_KEY_SEED_HEX", "not-hex");
+    assert!(qib_cloud_backend::load_signing_key().is_err());
+    std::env::remove_var("SIGNING_KEY_SEED_HEX");
+}
+
+// ── V2.0 "dual-key rotation": sign_command_set / SigningKeySet ─────────
+
+#[test]
+fn sign_command_set_produces_only_a_primary_signature_without_a_previous_key() {
+    let current = SigningKey::generate(&mut OsRng);
+    let keys = SigningKeySet {
+        current,
+        previous: None,
+    };
+    let cmd = make_cmd(1);
+
+    let signatures = sign_command_set(&cmd, &keys);
+    assert!(
+        signatures.secondary.is_none(),
+        "outside a rotation window, there must be no secondary signature at all"
+    );
+    assert_eq!(signatures.primary.to_bytes(), sign_command(&cmd, &keys.current).to_bytes());
+}
+
+#[test]
+fn sign_command_set_produces_both_signatures_during_a_rotation_window() {
+    let current = SigningKey::generate(&mut OsRng);
+    let previous = SigningKey::generate(&mut OsRng);
+    let cmd = make_cmd(1);
+
+    let keys = SigningKeySet {
+        current,
+        previous: Some(previous),
+    };
+    let signatures = sign_command_set(&cmd, &keys);
+
+    let expected_primary = sign_command(&cmd, &keys.current);
+    let expected_secondary = sign_command(&cmd, keys.previous.as_ref().unwrap());
+
+    assert_eq!(signatures.primary.to_bytes(), expected_primary.to_bytes());
+    assert_eq!(
+        signatures.secondary.expect("secondary must be present during a rotation window").to_bytes(),
+        expected_secondary.to_bytes()
+    );
+    // The two signatures must genuinely differ (different keys signing the
+    // same digest) — a regression that accidentally signed twice with the
+    // same key would still pass a naive "secondary is Some" check but not
+    // this one.
+    assert_ne!(signatures.primary.to_bytes(), signatures.secondary.unwrap().to_bytes());
+}
+
+/// End-to-end simulation of a full dual-key rotation lifecycle, entirely
+/// on the signing side (the edge-proxy verification side of this same
+/// lifecycle is covered by `qib-edge-proxy`'s
+/// `proxy_trusting_only_the_*_key_accepts_via_the_*_signature` tests).
+/// This documents the operator-facing sequence `KEY_MANAGEMENT_SCOPE.md`
+/// describes: start signing with both keys, then — once every edge proxy
+/// has confirmed picking up the new trusted key — drop the previous key
+/// and return to single-signature signing.
+#[test]
+fn rotation_lifecycle_starts_dual_and_ends_single() {
+    let old_key = SigningKey::generate(&mut OsRng);
+    let new_key = SigningKey::generate(&mut OsRng);
+    let cmd = make_cmd(1);
+
+    // Phase 1 (before rotation): single-key, old key only — the state
+    // every deployment starts in and the state this whole feature must
+    // not disturb when no rotation is in progress.
+    let phase1 = SigningKeySet {
+        current: SigningKey::from_bytes(&old_key.to_bytes()),
+        previous: None,
+    };
+    let sig1 = sign_command_set(&cmd, &phase1);
+    assert!(sig1.secondary.is_none());
+
+    // Phase 2 (rotation window open): current = new key, previous = old
+    // key — both signatures attached, so proxies at any stage of picking
+    // up the new trusted key stay connected.
+    let phase2 = SigningKeySet {
+        current: SigningKey::from_bytes(&new_key.to_bytes()),
+        previous: Some(SigningKey::from_bytes(&old_key.to_bytes())),
+    };
+    let sig2 = sign_command_set(&cmd, &phase2);
+    assert!(sig2.secondary.is_some());
+    assert_eq!(sig2.primary.to_bytes(), sign_command(&cmd, &new_key).to_bytes());
+    assert_eq!(
+        sig2.secondary.unwrap().to_bytes(),
+        sign_command(&cmd, &old_key).to_bytes()
+    );
+
+    // Phase 3 (rotation complete): current = new key, previous = None —
+    // back to single-signature signing, now on the new key.
+    let phase3 = SigningKeySet {
+        current: SigningKey::from_bytes(&new_key.to_bytes()),
+        previous: None,
+    };
+    let sig3 = sign_command_set(&cmd, &phase3);
+    assert!(sig3.secondary.is_none());
+    assert_eq!(sig3.primary.to_bytes(), sign_command(&cmd, &new_key).to_bytes());
+}

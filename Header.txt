@@ -1,0 +1,91 @@
+kQIB Fleet v3.1 — Dual-Key Signing Rotation (consolidated)
+
+This is the single, consolidated deliverable for the full kqib workspace, now including dual-key command signing — the zero-downtime rotation gap explicitly flagged as deferred in the key-management scoping work.
+
+96/96 tests pass across the whole workspace, and both deployable binaries build cleanly.
+
+The gap, and why it mattered
+
+The edge proxy's TrustedKeyStore already supported trusting multiple public keys simultaneously (TRUSTED_PUBKEYS/TRUSTED_PUBKEYS_FILE are both comma/line-separated lists) — that half of rotation was already fine. The actual gap was on the backend: it signed every command with exactly one key, resolved once at startup. A live rotation needed:
+
+Push the new public key to every edge proxy's trusted set (already supported — just add a second entry).
+
+Switch the backend to sign with the new key.
+
+Eventually remove the old key from every edge proxy's trusted set.
+
+The problem is the ordering dependency between steps 1 and 2: if the backend switches to the new key before every edge proxy has picked up that new key (a real possibility across a fleet with proxies at different patch/restart cadences), every lagging proxy starts rejecting every command from the backend — with no visible error beyond a stream of signature-verification failures, until it catches up.
+
+The fix: sign with both keys during a transition window
+
+Rather than requiring strict ordering, the backend can now sign every command with both the current and previous key during an operator- controlled transition window, and the edge proxy accepts if either verifies. This removes the ordering dependency entirely: a proxy that's already updated matches the new (primary) signature; a proxy that hasn't matches the old (secondary) one; a proxy trusting both matches either.
+
+Backend (qib-cloud-backend)
+
+key_source.rs: EnvSeedKeySource was generalized to take the environment variable name as a parameter (previously hardcoded to SIGNING_KEY_SEED_HEX), so the same source type serves a new SIGNING_KEY_PREVIOUS_SEED_HEX / SIGNING_KEY_PREVIOUS_FILE pair for the previous key. New SigningKeySet { current, previous: Option<..> } with load_from_env() resolving both — previous is None unless explicitly configured, so a deployment that's never rotated a key behaves exactly as before.
+
+lib.rs: new DualSignature { primary, secondary: Option<..> } and sign_command_set(cmd, keys: &SigningKeySet) -> DualSignature, layered on top of the existing single-key sign_command (unchanged, still used internally and still exported for anything that only needs one signature).
+
+main.rs: PartitionWorker now holds Arc<SigningKeySet> instead of Arc<SigningKey>; every outgoing command is signed via sign_command_set, attaching the primary signature as the existing x-signature header and — only when a previous key is configured — a second x-signature-prev header.
+
+Edge proxy (qib-edge-proxy)
+
+verify_command_signature changed from accepting a single optional signature to a slice of candidate signature byte slices (&[&[u8]]), checking whether any candidate validates against any trusted key — this "any × any" check (not positional pairing) is what actually makes rotation order-independent.
+
+handle_command extracts both x-signature and x-signature-prev headers (either may be absent) and passes whichever are present as candidates.
+
+The operational sequence this enables
+
+1. Generate the new keypair. 2. Add the new PUBLIC key to every edge proxy's TRUSTED_PUBKEYS(_FILE), alongside the existing old key. (No backend change yet — proxies now trust both, backend still signs with only the old key.) 3. Wait for that to propagate to every proxy (with TRUSTED_PUBKEYS_FILE's background reload, this happens automatically within TRUSTED_PUBKEYS_RELOAD_SECS of the file being updated). 4. Switch the backend: SIGNING_KEY_SEED_HEX/SIGNING_KEY_FILE = new key, SIGNING_KEY_PREVIOUS_SEED_HEX/SIGNING_KEY_PREVIOUS_FILE = old key. Every command is now dual-signed. Every proxy — whether it's already picked up the new key or not — keeps accepting commands. 5. Once confident every proxy has the new key trusted (step 3 should already guarantee this, but this is the natural verification point), remove SIGNING_KEY_PREVIOUS_* from the backend. Back to single-key signing, now on the new key. 6. Eventually remove the old key from every edge proxy's trusted set. 
+
+Step 4 is the one this fix makes safe regardless of how far step 3 has actually propagated — that's the whole point.
+
+Testing
+
+key_source.rs (5 new tests): previous-key resolution priority (file over env-seed, mirroring the current-key priority), None when unset, SigningKeySet::load_from_env() loading both keys correctly.
+
+lib.rs/signing_tests.rs (3 new tests): sign_command_set produces only a primary signature without a previous key (i.e. behaves identically to before this feature existed) and both signatures with one configured (verified against independently-computed expected values, and asserting the two signatures actually differ — catching a regression that signed twice with the same key); and a full rotation lifecycle simulation (phase 1: single old key → phase 2: dual, new+old → phase 3: single new key) exercising the exact sequence above.
+
+qib-edge-proxy (5 new tests): a proxy trusting only the new key accepts via the primary signature; a proxy trusting only the old key accepts via the secondary; a proxy trusting both accepts either way; a proxy that never updated correctly loses access once the backend completes rotation (dropping the previous key) — documenting the required operational order rather than treating it as a bug; and a malformed secondary signature doesn't prevent a valid primary from verifying (each candidate judged independently).
+
+Recap: everything from earlier rounds
+
+Issue #1 — static Kafka partition assignment, validated against a real simulated broker, plus two rounds of genuine bare-metal QEMU validation of the shared-memory IPC ring buffer: one over BIOS disk I/O, one over ivshmem — a real PCI-mapped shared-memory region with the guest performing actual PCI configuration-space enumeration and a 32-bit protected-mode transition to reach it.
+
+Issue #2 — tautological scheduler test fixed; command signing and IPC dispatch wired end-to-end, including fixing a latent &mut self soundness bug in the shared-memory ring buffer.
+
+Twin-state persistence — worker restarts no longer silently reset breaker/variance/sequence state.
+
+Issue #4 — a real Prometheus /metrics HTTP server.
+
+Key management scope + smaller fixes — pluggable, hot-reloadable key sources; clock-sync overflow bound; opt-in shm cleanup; TWIN_STATE_TOPIC compaction visibility.
+
+Dual-key rotation (this round) — closes the last item explicitly deferred in the key-management scoping work.
+
+Incidental fixes required to validate this codebase (all rounds)
+
+Circular self-dependency in qib-cloud-backend/Cargo.toml.
+
+Invalid impl Trait syntax on the concrete BorrowedMessage struct.
+
+Type-inference gap in FutureRecord::to(...) calls with only .payload(...) set.
+
+Inline-const array syntax needing a newer rustc than this toolchain.
+
+Missing postcard dependency despite using postcard::Error directly.
+
+no_std-unsafe Vec usage in qib-schema, latent until building qib-muk in isolation.
+
+Toolchain note
+
+Validated with apt's Rust 1.75 (Ubuntu 24.04), qemu-system-x86 8.2.2, and standard binutils. Cargo.lock pins several transitive dependencies to versions compatible with 1.75 — see prior rounds' notes; nothing new needed pinning this round.
+
+Test summary
+
+TargetTestsqib-schema (lib)0qib-muk (lib)0qib-muk tests/ipc_tests.rs4qib-muk tests/scheduler_tests.rs5qib-edge-proxy (bin unit tests, all modules — incl. 5 new dual-key tests)25qib-edge-proxy tests/shm_ipc_tests.rs4qib-cloud-backend (lib, all modules — incl. 5 new key_source dual-key tests)35qib-cloud-backend (bin unit tests)0qib-cloud-backend tests/partition_tests.rs3qib-cloud-backend tests/mock_cluster_tests.rs3qib-cloud-backend tests/twin_persistence_tests.rs3qib-cloud-backend tests/signing_tests.rs (incl. 3 new dual-key tests)7qib-cloud-backend tests/twin_tests.rs4qib-cloud-backend tests/metrics_server_tests.rs1qib-cloud-backend tests/compaction_check_tests.rs1qemu-ipc-validation tests/validate.rs1qemu-ivshmem-validation tests/validate.rs1Doc-tests (4 crates)0Total96 
+
+Verification log
+
+Full workspace
+
+$ cargo test --workspace 
